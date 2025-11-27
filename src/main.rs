@@ -1,4 +1,5 @@
 mod chunking;
+mod clustering;
 mod docgen;
 mod docpack;
 mod embedding;
@@ -26,7 +27,7 @@ async fn main() -> anyhow::Result<()> {
 
     println!("\n✅ Docpack created successfully!");
     println!("\n📊 Summary:");
-    println!("  Project: {}", metadata.project_name.to_string());
+    println!("  Project: {}", metadata.project_name);
     println!("  Version: {}", metadata.docpack_version);
     println!("  Created: {}", metadata.created_at);
     println!("  Source: {}", metadata.repo_url.unwrap_or_default());
@@ -34,10 +35,16 @@ async fn main() -> anyhow::Result<()> {
     println!("  Chunks: {}", result.num_chunks);
     println!("  Embeddings: {}", result.num_embeddings);
 
+    // Get cluster count
+    let cluster_count = result.docpack.get_cluster_count().unwrap_or(0);
+    if cluster_count > 0 {
+        println!("  Clusters: {}", cluster_count);
+    }
+
     // Get node counts
     let node_counts = result.docpack.get_node_counts()?;
     if !node_counts.is_empty() {
-        println!("\n📈 Nodes:");
+        println!("\n📈 Documentation Nodes:");
         for (kind, count) in node_counts {
             println!("  {}: {}", kind, count);
         }

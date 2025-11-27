@@ -56,7 +56,22 @@ impl EmbeddingModel {
             .map_err(|e| anyhow::anyhow!("Failed to tokenize text: {}", e))?;
 
         // Get input IDs and attention mask
-        let input_ids: Vec<i64> = encoding.get_ids().iter().map(|&id| id as i64).collect();
+        // Clamp token IDs to valid vocab range for the model (0-30521 for BERT base)
+        // This handles mismatches between tokenizer and model vocabularies
+        const MAX_VOCAB_ID: i64 = 30521;
+        let input_ids: Vec<i64> = encoding
+            .get_ids()
+            .iter()
+            .map(|&id| {
+                let id_i64 = id as i64;
+                if id_i64 > MAX_VOCAB_ID {
+                    // Replace out-of-vocab tokens with [UNK] token (typically ID 100 in BERT)
+                    100_i64
+                } else {
+                    id_i64
+                }
+            })
+            .collect();
         let attention_mask: Vec<i64> = encoding
             .get_attention_mask()
             .iter()

@@ -304,6 +304,82 @@ impl DocPack {
         Ok(())
     }
 
+    /// Get all embeddings from the database
+    pub fn get_all_embeddings(&self) -> anyhow::Result<Vec<(i64, Vec<f32>)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT chunk_id, vector, dims FROM embeddings")?;
+
+        let results = stmt.query_map([], |row| {
+            let chunk_id: i64 = row.get(0)?;
+            let vector_bytes: Vec<u8> = row.get(1)?;
+            let dims: usize = row.get(2)?;
+
+            Ok((chunk_id, vector_bytes, dims))
+        })?;
+
+        let mut embeddings = Vec::new();
+        for result in results {
+            let (chunk_id, vector_bytes, dims) = result?;
+
+            // Decode f32 vector from bytes
+            let mut vector = Vec::with_capacity(dims);
+            for i in 0..dims {
+                let offset = i * 4;
+                if offset + 4 <= vector_bytes.len() {
+                    let bytes = [
+                        vector_bytes[offset],
+                        vector_bytes[offset + 1],
+                        vector_bytes[offset + 2],
+                        vector_bytes[offset + 3],
+                    ];
+                    vector.push(f32::from_le_bytes(bytes));
+                }
+            }
+
+            embeddings.push((chunk_id, vector));
+        }
+
+        Ok(embeddings)
+    }
+
+    /// Insert a cluster
+    pub fn insert_cluster(
+        &self,
+        label: Option<&str>,
+        size: usize,
+        score: Option<f32>,
+    ) -> anyhow::Result<i64> {
+        self.conn.execute(
+            "INSERT INTO clusters (label, size, score) VALUES (?1, ?2, ?3)",
+            params![label, size, score],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Insert cluster membership
+    pub fn insert_cluster_membership(&self, chunk_id: i64, cluster_id: i64) -> anyhow::Result<()> {
+        self.conn.execute(
+            "INSERT INTO cluster_membership (chunk_id, cluster_id) VALUES (?1, ?2)",
+            params![chunk_id, cluster_id],
+        )?;
+        Ok(())
+    }
+
+    /// Get chunks in a specific cluster
+    pub fn get_cluster_chunks(&self, cluster_id: i64) -> anyhow::Result<Vec<(i64, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT c.id, c.text
+             FROM chunks c
+             JOIN cluster_membership cm ON c.id = cm.chunk_id
+             WHERE cm.cluster_id = ?1",
+        )?;
+
+        let results = stmt.query_map([cluster_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+
+        Ok(results.collect::<SqlResult<Vec<_>>>()?)
+    }
+
     /// Insert a node
     pub fn insert_node(
         &self,
@@ -424,6 +500,14 @@ impl DocPack {
             .collect::<SqlResult<Vec<_>>>()?;
 
         Ok(results)
+    }
+
+    /// Get cluster count
+    pub fn get_cluster_count(&self) -> anyhow::Result<i64> {
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM clusters", [], |row| row.get(0))?;
+        Ok(count)
     }
 }
 
