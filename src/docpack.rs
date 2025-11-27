@@ -162,11 +162,45 @@ impl DocPack {
         Ok(())
     }
 
-    /// Insert metadata (can only be done once)
+    /// Clear all data from the docpack (but keep the schema)
+    pub fn clear_data(&self) -> anyhow::Result<()> {
+        self.conn.execute_batch(
+            r#"
+            DELETE FROM docs;
+            DELETE FROM edges;
+            DELETE FROM nodes;
+            DELETE FROM cluster_membership;
+            DELETE FROM clusters;
+            DELETE FROM embeddings;
+            DELETE FROM chunks;
+            DELETE FROM files;
+            DELETE FROM build_events;
+            DELETE FROM metadata;
+            "#
+        )?;
+
+        // For contentless FTS tables, we need to drop and recreate
+        self.conn.execute_batch(
+            r#"
+            DROP TABLE IF EXISTS docs_fts;
+            CREATE VIRTUAL TABLE docs_fts USING fts5(
+                node_id UNINDEXED,
+                summary,
+                details,
+                examples,
+                content=''
+            );
+            "#
+        )?;
+
+        Ok(())
+    }
+
+    /// Insert or replace metadata (overwrites existing metadata if present)
     pub fn insert_metadata(&self, meta: &Metadata) -> anyhow::Result<()> {
         self.conn.execute(
             r#"
-            INSERT INTO metadata (
+            INSERT OR REPLACE INTO metadata (
                 id, docpack_version, project_name, project_description,
                 repo_url, commit_sha, created_at, generator_version,
                 language, extra
@@ -394,6 +428,7 @@ impl DocPack {
 }
 
 /// Create a new docpack in ~/.localdoc/docpacks/
+/// If a docpack with the same name already exists, it will be cleared and reused
 pub fn create_docpack(project_name: &str) -> anyhow::Result<(DocPack, PathBuf)> {
     // Get home directory
     let home = std::env::var("HOME")
@@ -406,7 +441,16 @@ pub fn create_docpack(project_name: &str) -> anyhow::Result<(DocPack, PathBuf)> 
     let filename = format!("{}.docpack", project_name);
     let filepath = docpacks_dir.join(filename);
 
-    let pack = DocPack::create(&filepath)?;
+    // Check if docpack already exists
+    let pack = if filepath.exists() {
+        // Open existing docpack and clear all data
+        let pack = DocPack::open(&filepath)?;
+        pack.clear_data()?;
+        pack
+    } else {
+        // Create new docpack
+        DocPack::create(&filepath)?
+    };
 
     Ok((pack, filepath))
 }
