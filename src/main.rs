@@ -1,8 +1,8 @@
 use ollama_rs::Ollama;
 use ollama_rs::generation::completion::request::GenerationRequest;
 use ollama_rs::generation::parameters::FormatType;
-use std::io::{self, Write};
 use std::env;
+use std::io::{self, Write};
 use tokio_stream::StreamExt;
 
 #[tokio::main]
@@ -17,9 +17,10 @@ async fn main() {
     let prompt = "Why is the sky blue?";
     let format = FormatType::Json;
 
-    println!("│ Ollama Streaming Response");
+    println!("\r===\r");
     println!("│ Model: {}", model);
     println!("│ Prompt: {}", prompt);
+    println!("\r===\r");
 
     // Enable thinking + streaming
     let req = GenerationRequest::new(model.to_string(), prompt.to_string())
@@ -90,5 +91,5 @@ async fn main() {
         }
     }
 
-    println!("\n✨ Stream completed!");
+    println!("\n== REQUEST FINISHED ==");
 }
