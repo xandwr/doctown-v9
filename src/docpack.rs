@@ -176,7 +176,7 @@ impl DocPack {
             DELETE FROM files;
             DELETE FROM build_events;
             DELETE FROM metadata;
-            "#
+            "#,
         )?;
 
         // For contentless FTS tables, we need to drop and recreate
@@ -190,7 +190,7 @@ impl DocPack {
                 examples,
                 content=''
             );
-            "#
+            "#,
         )?;
 
         Ok(())

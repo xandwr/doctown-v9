@@ -1,10 +1,12 @@
 use anyhow::{Context, Result};
 use ort::session::{Session, builder::GraphOptimizationLevel};
 use std::path::Path;
+use tokenizers::Tokenizer;
 
 /// Embedding model for generating vector representations of text
 pub struct EmbeddingModel {
     session: Session,
+    tokenizer: Tokenizer,
     dims: usize,
 }
 
@@ -20,11 +22,24 @@ impl EmbeddingModel {
             .commit_from_file(&model_path)
             .context("Failed to load ONNX model")?;
 
+        // Load tokenizer from the same directory as the model
+        let model_dir = model_path
+            .as_ref()
+            .parent()
+            .context("Failed to get model directory")?;
+        let tokenizer_path = model_dir.join("tokenizer.json");
+
+        let tokenizer = Tokenizer::from_file(&tokenizer_path)
+            .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?;
+
         // For MiniLM-L6, the output dimension is 384
-        // This should ideally be detected from the model metadata
         let dims = 384;
 
-        Ok(Self { session, dims })
+        Ok(Self {
+            session,
+            tokenizer,
+            dims,
+        })
     }
 
     /// Get the embedding dimension
@@ -34,40 +49,67 @@ impl EmbeddingModel {
 
     /// Embed a single text string
     pub fn embed_text(&mut self, text: &str) -> Result<Vec<f32>> {
-        // Tokenize the text
-        let tokens = tokenize_simple(text);
+        // Tokenize the text using the proper tokenizer
+        let encoding = self
+            .tokenizer
+            .encode(text, true)
+            .map_err(|e| anyhow::anyhow!("Failed to tokenize text: {}", e))?;
 
-        // Convert to input IDs (simple word hashing for now)
-        let input_ids = tokens_to_ids(&tokens);
-
-        // Create attention mask (all ones)
-        let attention_mask: Vec<i64> = vec![1; input_ids.len()];
+        // Get input IDs and attention mask
+        let input_ids: Vec<i64> = encoding.get_ids().iter().map(|&id| id as i64).collect();
+        let attention_mask: Vec<i64> = encoding
+            .get_attention_mask()
+            .iter()
+            .map(|&m| m as i64)
+            .collect();
+        let token_type_ids: Vec<i64> = encoding.get_type_ids().iter().map(|&t| t as i64).collect();
 
         // Pad or truncate to max length (512 for BERT-based models)
         let max_len = 512;
         let mut padded_input_ids = input_ids;
         let mut padded_attention_mask = attention_mask;
+        let mut padded_token_type_ids = token_type_ids;
 
         if padded_input_ids.len() > max_len {
             padded_input_ids.truncate(max_len);
             padded_attention_mask.truncate(max_len);
+            padded_token_type_ids.truncate(max_len);
         } else {
             let padding = max_len - padded_input_ids.len();
             padded_input_ids.extend(vec![0; padding]);
             padded_attention_mask.extend(vec![0; padding]);
+            padded_token_type_ids.extend(vec![0; padding]);
         }
 
         // Clone the attention mask for later use
         let attention_mask_copy = padded_attention_mask.clone();
 
-        // Run inference
+        // Run inference - create tensors properly
+        use ort::value::Tensor;
+        let input_ids_tensor = Tensor::from_array((
+            vec![1_i64, max_len as i64],
+            padded_input_ids.into_boxed_slice(),
+        ))
+        .context("Failed to create input_ids tensor")?;
+        let attention_mask_tensor = Tensor::from_array((
+            vec![1_i64, max_len as i64],
+            padded_attention_mask.into_boxed_slice(),
+        ))
+        .context("Failed to create attention_mask tensor")?;
+        let token_type_ids_tensor = Tensor::from_array((
+            vec![1_i64, max_len as i64],
+            padded_token_type_ids.into_boxed_slice(),
+        ))
+        .context("Failed to create token_type_ids tensor")?;
+
         let outputs = self
             .session
             .run(ort::inputs![
-                "input_ids" => ort::value::Tensor::from_array(([1, max_len], padded_input_ids))?,
-                "attention_mask" => ort::value::Tensor::from_array(([1, max_len], padded_attention_mask))?
+                "input_ids" => input_ids_tensor,
+                "attention_mask" => attention_mask_tensor,
+                "token_type_ids" => token_type_ids_tensor
             ])
-            .context("Failed to run model inference")?;
+            .map_err(|e| anyhow::anyhow!("Failed to run model inference: {}", e))?;
 
         // Extract the output tensor
         // The output is typically the last hidden state or pooled output
@@ -94,32 +136,6 @@ impl EmbeddingModel {
         // A real implementation would batch these together
         texts.iter().map(|text| self.embed_text(text)).collect()
     }
-}
-
-/// Simple tokenization (word-level)
-/// In production, use a proper tokenizer like `tokenizers` crate
-fn tokenize_simple(text: &str) -> Vec<String> {
-    text.to_lowercase()
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|s| !s.is_empty())
-        .map(String::from)
-        .collect()
-}
-
-/// Convert tokens to IDs using a simple hash
-/// In production, use a proper vocabulary from the tokenizer
-fn tokens_to_ids(tokens: &[String]) -> Vec<i64> {
-    tokens
-        .iter()
-        .map(|token| {
-            // Simple hash-based ID assignment
-            // This is a placeholder - real models need proper vocab
-            let hash = token
-                .bytes()
-                .fold(0u32, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u32));
-            (hash % 30000 + 1000) as i64 // Keep in reasonable range
-        })
-        .collect()
 }
 
 /// Mean pooling over sequence dimension
@@ -158,12 +174,6 @@ fn normalize(vec: &[f32]) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_tokenize() {
-        let tokens = tokenize_simple("Hello, world! This is a test.");
-        assert_eq!(tokens, vec!["hello", "world", "this", "is", "a", "test"]);
-    }
 
     #[test]
     fn test_normalize() {

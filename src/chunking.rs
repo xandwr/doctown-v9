@@ -112,11 +112,7 @@ fn chunk_code_file(file_id: i64, text: &str, config: &ChunkConfig) -> Vec<Chunk>
             });
 
             // Start next chunk with overlap
-            current_start = if i > config.overlap_lines {
-                i - config.overlap_lines + 1
-            } else {
-                i + 1
-            };
+            current_start = i.saturating_sub(config.overlap_lines) + 1;
             in_block = false;
         }
     }
@@ -240,8 +236,8 @@ fn chunk_generic_file(file_id: i64, text: &str, config: &ChunkConfig) -> Vec<Chu
             });
         }
 
-        start = end - config.overlap_lines.min(end);
-        if start >= lines.len() - config.min_lines {
+        start = end.saturating_sub(config.overlap_lines);
+        if start >= lines.len().saturating_sub(config.min_lines) {
             break; // Avoid tiny trailing chunks
         }
     }
