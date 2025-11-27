@@ -4,7 +4,7 @@ use crate::docpack::{DocPack, Metadata, create_docpack};
 use crate::embedding::EmbeddingModel;
 use crate::ingest::IngestWorkspace;
 use crate::llm::{LLMBackend, create_provider};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 use tokio_stream::StreamExt;
 
@@ -20,7 +20,7 @@ impl Default for DocGenConfig {
             llm_backend: LLMBackend::Ollama {
                 host: "http://localhost".into(),
                 port: 11434,
-                model: "qwen3:4b".into(),
+                model: "qwen3:0.6b".into(),
             },
             embedding_model_path: Some("embedding/minilm-l6/model.onnx".into()),
         }
@@ -39,6 +39,153 @@ pub struct DocGenResult {
     pub embedding_duration: Option<Duration>,
     pub clustering_duration: Option<Duration>,
     pub llm_duration: Option<Duration>,
+}
+
+/// Extract symbols from code text
+fn extract_symbols(text: &str) -> HashSet<String> {
+    let mut symbols = HashSet::new();
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("fn ") || trimmed.starts_with("pub fn ") {
+            if let Some(name) = trimmed.split_whitespace().nth(1) {
+                symbols.insert(name.trim_end_matches('(').to_string());
+            }
+        } else if trimmed.starts_with("struct ") || trimmed.starts_with("pub struct ") {
+            if let Some(name) = trimmed.split_whitespace().nth(1) {
+                symbols.insert(name.trim_end_matches('<').trim_end_matches('{').to_string());
+            }
+        } else if trimmed.starts_with("enum ") || trimmed.starts_with("pub enum ") {
+            if let Some(name) = trimmed.split_whitespace().nth(1) {
+                symbols.insert(name.trim_end_matches('{').to_string());
+            }
+        } else if trimmed.starts_with("trait ") || trimmed.starts_with("pub trait ") {
+            if let Some(name) = trimmed.split_whitespace().nth(1) {
+                symbols.insert(name.trim_end_matches('<').trim_end_matches('{').to_string());
+            }
+        } else if trimmed.starts_with("impl ") {
+            if let Some(parts) = trimmed.split_whitespace().nth(1) {
+                symbols.insert(
+                    parts
+                        .trim_end_matches('<')
+                        .trim_end_matches('{')
+                        .to_string(),
+                );
+            }
+        }
+    }
+
+    symbols
+}
+
+/// Build a focused prompt for a batch of clusters (3-5 clusters per batch)
+fn build_batch_prompt(batch_clusters: &[(i64, Vec<(i64, String)>)]) -> String {
+    let mut prompt = String::new();
+
+    prompt.push_str("You are a code documentation expert. Analyze these semantically-related code clusters and provide concise documentation for each.\n\n");
+
+    for (cluster_id, cluster_chunks) in batch_clusters {
+        // CPU-side deterministic symbol extraction
+        let mut symbols_found = HashSet::new();
+        let mut combined_text = String::new();
+
+        for (_chunk_id, text) in cluster_chunks {
+            combined_text.push_str(text);
+            combined_text.push('\n');
+            symbols_found.extend(extract_symbols(text));
+        }
+
+        prompt.push_str(&format!(
+            "## Cluster {} ({} chunks)\n\n",
+            cluster_id,
+            cluster_chunks.len()
+        ));
+
+        if !symbols_found.is_empty() {
+            prompt.push_str("**Symbols**: ");
+            prompt.push_str(&symbols_found.into_iter().collect::<Vec<_>>().join(", "));
+            prompt.push_str("\n\n");
+        }
+
+        prompt.push_str("**Code**:\n```\n");
+        // Limit per cluster to keep batch manageable
+        let char_limit = 2500;
+        if combined_text.len() > char_limit {
+            prompt.push_str(&combined_text[..char_limit]);
+            prompt.push_str("\n... (truncated)\n");
+        } else {
+            prompt.push_str(&combined_text);
+        }
+        prompt.push_str("```\n\n");
+    }
+
+    prompt.push_str("**Task**: For EACH cluster above, provide brief documentation covering:\n");
+    prompt.push_str("1. **Purpose**: What this code does (1-2 sentences)\n");
+    prompt.push_str("2. **Key Components**: Main functions/types and their roles\n");
+    prompt.push_str("3. **Usage**: How components interact or are used\n\n");
+    prompt.push_str(
+        "Format your response with clear cluster headers like '## Cluster N' for each one.\n",
+    );
+    prompt.push_str("Be concise and focus on clarity.");
+
+    prompt
+}
+
+/// Parse batch LLM response and split into per-cluster documentation
+fn parse_batch_response(
+    response: &str,
+    batch_clusters: &[(i64, Vec<(i64, String)>)],
+) -> Vec<(i64, String)> {
+    let mut cluster_docs = Vec::new();
+
+    // Try to split by "## Cluster N" headers
+    let lines: Vec<&str> = response.lines().collect();
+    let mut current_cluster_id: Option<i64> = None;
+    let mut current_content = String::new();
+
+    for line in lines {
+        if line.starts_with("## Cluster ") {
+            // Save previous cluster if any
+            if let Some(cluster_id) = current_cluster_id {
+                if !current_content.trim().is_empty() {
+                    cluster_docs.push((cluster_id, current_content.trim().to_string()));
+                }
+            }
+
+            // Extract cluster number
+            if let Some(num_str) = line.strip_prefix("## Cluster ") {
+                if let Ok(cluster_id) = num_str
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .parse::<i64>()
+                {
+                    current_cluster_id = Some(cluster_id);
+                    current_content.clear();
+                }
+            }
+        } else if current_cluster_id.is_some() {
+            current_content.push_str(line);
+            current_content.push('\n');
+        }
+    }
+
+    // Save last cluster
+    if let Some(cluster_id) = current_cluster_id {
+        if !current_content.trim().is_empty() {
+            cluster_docs.push((cluster_id, current_content.trim().to_string()));
+        }
+    }
+
+    // If parsing failed, distribute response evenly across clusters
+    if cluster_docs.is_empty() && !batch_clusters.is_empty() {
+        let doc_per_cluster = response.to_string();
+        for (cluster_id, _) in batch_clusters {
+            cluster_docs.push((*cluster_id, doc_per_cluster.clone()));
+        }
+    }
+
+    cluster_docs
 }
 
 /// Generate a docgen output and populate a SQLite docpack
@@ -240,147 +387,121 @@ pub async fn run_docgen(
         None
     };
 
-    // Step 5: Build comprehensive single-shot documentation prompt
-    println!("\n📝 Generating documentation (single batch)...");
+    // Step 5: Generate documentation in batches (3-5 clusters per batch)
+    const BATCH_SIZE: usize = 4; // Sweet spot for balancing KV priming vs locality
+    let num_batches = (num_clusters + BATCH_SIZE - 1) / BATCH_SIZE;
+
+    println!(
+        "\n📝 Generating documentation ({} batches of ~{} clusters)...",
+        num_batches, BATCH_SIZE
+    );
     let llm_start = Instant::now();
 
-    let mut batch_prompt = String::new();
-    batch_prompt.push_str("You are an expert code documentation generator. Analyze this codebase and generate comprehensive documentation.\n\n");
+    let mut total_doc_chars = 0;
+    let mut cluster_docs = Vec::new();
 
-    // Add file structure overview
-    batch_prompt.push_str("## Project Structure\n\n");
-    for (path, contents) in workspace.files.iter().take(100) {
-        if let Ok(text) = String::from_utf8(contents.clone()) {
-            let lines = text.lines().count();
-            batch_prompt.push_str(&format!("- {} ({} lines)\n", path, lines));
-        }
-    }
-    if workspace.files.len() > 100 {
-        batch_prompt.push_str(&format!(
-            "\n... and {} more files\n",
-            workspace.files.len() - 100
-        ));
-    }
-
-    // Add clustered code sections with CPU-extracted metadata
     if num_clusters > 0 {
-        batch_prompt.push_str("\n## Code Clusters (Semantically Related)\n\n");
+        // Process clusters in batches
+        for batch_idx in 0..num_batches {
+            let batch_start_cluster = ((batch_idx * BATCH_SIZE) + 1) as i64;
+            let batch_end_cluster = (((batch_idx + 1) * BATCH_SIZE).min(num_clusters)) as i64;
 
-        for cluster_id in 1..=num_clusters as i64 {
-            let cluster_chunks = docpack.get_cluster_chunks(cluster_id)?;
-            if cluster_chunks.is_empty() {
-                continue;
-            }
-
-            batch_prompt.push_str(&format!(
-                "### Cluster {} ({} chunks)\n\n",
-                cluster_id,
-                cluster_chunks.len()
-            ));
-
-            // CPU-side deterministic extraction
-            let mut symbols_found = std::collections::HashSet::new();
-            let mut combined_text = String::new();
-
-            for (_chunk_id, text) in &cluster_chunks {
-                combined_text.push_str(text);
-                combined_text.push('\n');
-
-                // Extract symbols deterministically
-                for line in text.lines() {
-                    let trimmed = line.trim();
-                    if trimmed.starts_with("fn ") || trimmed.starts_with("pub fn ") {
-                        if let Some(name) = trimmed.split_whitespace().nth(1) {
-                            symbols_found.insert(name.trim_end_matches('(').to_string());
-                        }
-                    } else if trimmed.starts_with("struct ") || trimmed.starts_with("pub struct ") {
-                        if let Some(name) = trimmed.split_whitespace().nth(1) {
-                            symbols_found.insert(
-                                name.trim_end_matches('<').trim_end_matches('{').to_string(),
-                            );
-                        }
-                    } else if trimmed.starts_with("enum ") || trimmed.starts_with("pub enum ") {
-                        if let Some(name) = trimmed.split_whitespace().nth(1) {
-                            symbols_found.insert(name.trim_end_matches('{').to_string());
-                        }
-                    } else if trimmed.starts_with("trait ") || trimmed.starts_with("pub trait ") {
-                        if let Some(name) = trimmed.split_whitespace().nth(1) {
-                            symbols_found.insert(
-                                name.trim_end_matches('<').trim_end_matches('{').to_string(),
-                            );
-                        }
-                    }
+            // Collect cluster data for this batch
+            let mut batch_clusters: Vec<(i64, Vec<(i64, String)>)> = Vec::new();
+            for cluster_id in batch_start_cluster..=batch_end_cluster {
+                let cluster_chunks = docpack.get_cluster_chunks(cluster_id)?;
+                if !cluster_chunks.is_empty() {
+                    batch_clusters.push((cluster_id, cluster_chunks));
                 }
             }
 
-            // Show extracted symbols
-            if !symbols_found.is_empty() {
-                batch_prompt.push_str("**Symbols detected**: ");
-                batch_prompt.push_str(&symbols_found.into_iter().collect::<Vec<_>>().join(", "));
-                batch_prompt.push_str("\n\n");
+            if batch_clusters.is_empty() {
+                continue;
             }
 
-            // Include condensed code (limit to prevent overflow)
-            let char_limit = 2000;
-            if combined_text.len() > char_limit {
-                batch_prompt.push_str("```\n");
-                batch_prompt.push_str(&combined_text[..char_limit]);
-                batch_prompt.push_str("\n... (truncated)\n```\n\n");
-            } else {
-                batch_prompt.push_str("```\n");
-                batch_prompt.push_str(&combined_text);
-                batch_prompt.push_str("```\n\n");
+            // Build batch prompt covering 3-5 clusters
+            let batch_prompt = build_batch_prompt(&batch_clusters);
+            let total_chunks: usize = batch_clusters.iter().map(|(_, c)| c.len()).sum();
+
+            print!(
+                "  Batch {} (clusters {}-{}, {} chunks, {} chars)...",
+                batch_idx + 1,
+                batch_start_cluster,
+                batch_end_cluster,
+                total_chunks,
+                batch_prompt.len()
+            );
+
+            let batch_time_start = Instant::now();
+            let mut stream = llm_provider.generate_stream(batch_prompt).await?;
+
+            let mut batch_response = String::new();
+            while let Some(chunk_result) = stream.next().await {
+                let chunk = chunk_result?;
+                if !chunk.is_empty() {
+                    batch_response.push_str(&chunk);
+                }
             }
-        }
-    }
 
-    // Single instruction for all documentation
-    batch_prompt.push_str(
-        r#"
-## Task
+            let batch_duration = batch_time_start.elapsed();
+            println!(" {} chars in {:.2?}", batch_response.len(), batch_duration);
 
-Generate comprehensive documentation in this exact structure:
+            total_doc_chars += batch_response.len();
 
-### Project Overview
-Brief summary of what this project does, its purpose, and main technologies.
+            // Parse batch response and split by cluster
+            // Simple heuristic: split by "## Cluster N" headers
+            let cluster_sections = parse_batch_response(&batch_response, &batch_clusters);
 
-### Architecture
-High-level organization: main modules, their responsibilities, and interactions.
-
-"#,
-    );
-
-    if num_clusters > 0 {
-        batch_prompt.push_str("### Cluster Analysis\n");
-        batch_prompt.push_str("For each cluster above, describe:\n");
-        batch_prompt.push_str("- **Theme**: Common purpose/pattern\n");
-        batch_prompt.push_str("- **Key Components**: Main symbols and their roles\n");
-        batch_prompt.push_str("- **Relationships**: How components interact\n\n");
-    }
-
-    batch_prompt.push_str("Keep each section concise. Focus on clarity and usefulness.");
-
-    // Single LLM call with extended context
-    println!("  Sending batch prompt (~{} chars)...", batch_prompt.len());
-
-    let mut stream = llm_provider.generate_stream(batch_prompt).await?;
-
-    let mut full_response = String::new();
-    while let Some(chunk_result) = stream.next().await {
-        let chunk = chunk_result?;
-        if !chunk.is_empty() {
-            full_response.push_str(&chunk);
+            for (cluster_id, cluster_doc) in cluster_sections {
+                cluster_docs.push((cluster_id, cluster_doc));
+            }
         }
     }
 
     let llm_duration = llm_start.elapsed();
     println!(
-        "✓ Generated {} chars of documentation in {:.2?}",
-        full_response.len(),
-        llm_duration
+        "✓ Generated {} chars of documentation across {} clusters in {} batches in {:.2?}",
+        total_doc_chars, num_clusters, num_batches, llm_duration
     );
 
-    // Store in database - architecture overview
+    // Store per-cluster documentation in database
+    for (cluster_id, cluster_doc) in &cluster_docs {
+        let cluster_node = docpack.insert_node(
+            "cluster",
+            Some(&format!("cluster_{}", cluster_id)),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )?;
+
+        docpack.insert_doc(
+            cluster_node,
+            Some(&format!("Cluster {} Documentation", cluster_id)),
+            Some(cluster_doc),
+            None,
+            None,
+            None,
+        )?;
+    }
+
+    // Create aggregated architecture overview
+    let mut full_response = String::new();
+    full_response.push_str("# Project Documentation\n\n");
+    full_response.push_str("## Architecture Overview\n\n");
+    full_response.push_str(&format!(
+        "This project is organized into {} semantic clusters:\n\n",
+        num_clusters
+    ));
+
+    for (cluster_id, cluster_doc) in &cluster_docs {
+        full_response.push_str(&format!("### Cluster {}\n\n", cluster_id));
+        full_response.push_str(cluster_doc);
+        full_response.push_str("\n\n");
+    }
+
     let node_id = docpack.insert_node(
         "architecture",
         Some("project_documentation"),
@@ -400,33 +521,6 @@ High-level organization: main modules, their responsibilities, and interactions.
         None,
         None,
     )?;
-
-    // Also create per-cluster nodes by parsing response sections
-    if num_clusters > 0 {
-        // Simple heuristic: split by cluster headers
-        for cluster_id in 1..=num_clusters as i64 {
-            let cluster_node = docpack.insert_node(
-                "cluster",
-                Some(&format!("cluster_{}", cluster_id)),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )?;
-
-            // Store a reference to the full doc
-            docpack.insert_doc(
-                cluster_node,
-                Some(&format!("Cluster {} Documentation", cluster_id)),
-                Some("See main project documentation for cluster analysis."),
-                None,
-                None,
-                None,
-            )?;
-        }
-    }
 
     // Log completion event
     docpack.add_build_event(
