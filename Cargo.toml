@@ -5,10 +5,12 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.100"
+async-trait = "0.1"
 chrono = "0.4"
+futures = "0.3"
 ollama-rs = { version = "0.3.3", features = ["stream"] }
 ort = { version = "2.0.0-rc.10", features = ["cuda"] }
-reqwest = "0.12.24"
+reqwest = { version = "0.12.24", features = ["json", "stream"] }
 rusqlite = { version = "0.37.0", features = ["bundled", "blob"] }
 serde = "1.0.228"
 serde_json = "1.0"

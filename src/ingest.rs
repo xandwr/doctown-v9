@@ -3,6 +3,7 @@ use serde::Deserialize;
 use std::{
     collections::HashMap,
     io::{Cursor, Read},
+    time::Instant,
 };
 use thiserror::Error;
 use url::Url;
@@ -75,6 +76,7 @@ pub async fn ingest_github_repo(url: &str) -> Result<IngestWorkspace, IngestErro
     }
 
     // 4 — Extract into memory
+    let parse_start = Instant::now();
     let cursor = Cursor::new(raw);
     let mut archive = ZipArchive::new(cursor)?;
     let mut workspace = IngestWorkspace {
@@ -93,6 +95,9 @@ pub async fn ingest_github_repo(url: &str) -> Result<IngestWorkspace, IngestErro
 
         workspace.files.insert(path, contents);
     }
+
+    let parse_duration = parse_start.elapsed();
+    println!("⏱️  ZIP parsing completed in {:.2?}", parse_duration);
 
     Ok(workspace)
 }

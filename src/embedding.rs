@@ -3,6 +3,13 @@ use ort::session::{Session, builder::GraphOptimizationLevel};
 use std::path::Path;
 use tokenizers::Tokenizer;
 
+/// Check if CUDA is available for ONNX Runtime
+fn check_cuda_availability() -> bool {
+    // Check if CUDA libraries are available
+    // This is a simple check - ORT will do the real validation
+    std::env::var("CUDA_PATH").is_ok() || std::path::Path::new("/usr/local/cuda").exists()
+}
+
 /// Embedding model for generating vector representations of text
 pub struct EmbeddingModel {
     session: Session,
@@ -13,14 +20,34 @@ pub struct EmbeddingModel {
 impl EmbeddingModel {
     /// Load an embedding model from an ONNX file
     pub fn from_file<P: AsRef<Path>>(model_path: P) -> Result<Self> {
+        println!("🔧 Configuring embedding model with CUDA support...");
+
+        // Check CUDA availability
+        let cuda_available = check_cuda_availability();
+        if cuda_available {
+            println!("  CUDA environment detected");
+        } else {
+            println!("  No CUDA environment detected, will use CPU");
+        }
+
+        // Try to use CUDA if available, fall back to CPU
         let session = Session::builder()
             .context("Failed to create session builder")?
+            .with_execution_providers([
+                ort::execution_providers::CUDAExecutionProvider::default()
+                    .with_device_id(0)
+                    .build(),
+                ort::execution_providers::CPUExecutionProvider::default().build(),
+            ])
+            .context("Failed to set execution providers")?
             .with_optimization_level(GraphOptimizationLevel::Level3)
             .context("Failed to set optimization level")?
             .with_intra_threads(4)
             .context("Failed to set thread count")?
             .commit_from_file(&model_path)
             .context("Failed to load ONNX model")?;
+
+        println!("✓ Embedding model loaded (CUDA enabled if available)");
 
         // Load tokenizer from the same directory as the model
         let model_dir = model_path
@@ -49,6 +76,12 @@ impl EmbeddingModel {
 
     /// Embed a single text string
     pub fn embed_text(&mut self, text: &str) -> Result<Vec<f32>> {
+        // Log first inference to confirm execution provider
+        static FIRST_RUN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+        if FIRST_RUN.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            println!("  Running first inference (execution provider will be initialized)...");
+        }
+
         // Tokenize the text using the proper tokenizer
         let encoding = self
             .tokenizer
