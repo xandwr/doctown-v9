@@ -20,7 +20,7 @@ impl Default for DocGenConfig {
             llm_backend: LLMBackend::Ollama {
                 host: "http://localhost".into(),
                 port: 11434,
-                model: "qwen3:0.6b".into(),
+                model: "qwen3:1.7b".into(),
             },
             embedding_model_path: Some("embedding/minilm-l6/model.onnx".into()),
         }
